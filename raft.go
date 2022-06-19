@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,9 @@ type AppendEntriesRequest struct {
 	PrevLogTerm  int
 	Entries      []*Log
 	LeaderCommit int
+
+	// 4 test
+	PeerEndpoint string
 }
 
 type AppendEntriesResponse struct {
@@ -38,6 +42,9 @@ type RequestVoteRequest struct {
 	CandidateId  string
 	LastLogIndex int
 	LastLogTerm  int
+
+	// 4 test
+	PeerEndpoint string
 }
 
 type RequestVoteResponse struct {
@@ -86,6 +93,7 @@ type server struct {
 	peers []*peer
 
 	lg     *zap.Logger
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -134,6 +142,8 @@ func (p *peer) sendAppendEntries(entries []*Log) (*AppendEntriesResponse, error)
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: p.svr.commitIndex,
+
+		PeerEndpoint: p.endpoint,
 	}
 
 	resp, err := p.rpc.AppendEntries(&req)
@@ -142,9 +152,10 @@ func (p *peer) sendAppendEntries(entries []*Log) (*AppendEntriesResponse, error)
 	}
 
 	// 刷新peer的信息
-	p.nextIndex = entries[len(entries)-1].Index + 1
-	p.matchIndex = entries[len(entries)-1].Index
-
+	if len(entries) > 0 {
+		p.nextIndex = entries[len(entries)-1].Index + 1
+		p.matchIndex = entries[len(entries)-1].Index
+	}
 	return resp, nil
 }
 
@@ -171,25 +182,32 @@ func newServer(peerEndpoints []string, serverId string) *server {
 	svr.logs = append(svr.logs, logHeader)
 	svr.votedFor.Store("")
 
-	for _, pr := range peerEndpoints {
+	for _, endpoint := range peerEndpoints {
 		svr.peers = append(
 			svr.peers,
 			&peer{
 				svr:        &svr,
 				nextIndex:  len(svr.logs),
 				matchIndex: 0,
-				endpoint:   pr,
-				rpc:        newMemoryRpc(&svr),
+				endpoint:   endpoint,
+				rpc:        &MR,
 			},
 		)
 	}
 
 	ctx, cancel := context.WithCancel(context.TODO())
+	svr.ctx = ctx
 	svr.cancel = cancel
 
-	go svr.followerLoopClusterChange(ctx)
-
 	return &svr
+}
+
+func (svr *server) start() {
+	go svr.followerLoopClusterChange(svr.ctx)
+}
+
+func (svr *server) stop() {
+	svr.cancel()
 }
 
 // HandleAppendEntries follower 实现
@@ -267,12 +285,14 @@ func (svr *server) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntries
 
 	// TODO 下面的逻辑执行需要时间， lastAppendEntriesTime 更新延迟会导致 follower 角色的变更，应该尽量避免这种情况，否则会有很多无意义的rpc
 	svr.lastAppendEntriesTime = time.Now()
+	svr.votedFor.Store("")
 
 	// 5.3
 	if len(req.Entries) == 0 {
 		// 心跳的场景，不涉及信息的变更，只需要刷新 lastAppendEntriesTime 就行
 		svr.lg.Info("acceptAppend: heartbeat",
 			zap.String("serverId", svr.serverId),
+			zap.String("leaderId", req.LeaderId),
 			zap.Reflect("req.Entries", req.Entries))
 
 		return &AppendEntriesResponse{
@@ -286,6 +306,7 @@ func (svr *server) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntries
 		if log.Index <= req.PrevLogIndex {
 			svr.lg.Info("unexpected log.Index error",
 				zap.String("serverId", svr.serverId),
+				zap.String("leaderId", req.LeaderId),
 				zap.Reflect("log", log))
 			continue
 		}
@@ -314,6 +335,7 @@ func (svr *server) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntries
 
 	svr.lg.Info("acceptAppend: log entries",
 		zap.String("serverId", svr.serverId),
+		zap.String("leaderId", req.LeaderId),
 		zap.Reflect("req.Entries", req.Entries))
 
 	// TODO 日志到状态机是个异步的过程，会让log的append很快，状态更新近实时，async会导致返回结果后仍旧client拿不到，所以应该不太对
@@ -328,12 +350,17 @@ func (svr *server) HandleAppendEntries(req *AppendEntriesRequest) *AppendEntries
 func (svr *server) HandleRequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 	if svr.state == leader {
 		svr.lg.Info("rejectAppend: leader can not accept request vote request",
-			zap.String("serverId", svr.serverId))
+			zap.String("serverId", svr.serverId),
+			zap.String("req.CandidateId", req.CandidateId))
 
 		return &RequestVoteResponse{
 			Term:        svr.currentTerm,
 			VoteGranted: false,
 		}
+	}
+
+	if req.CandidateId == svr.serverId {
+		panic(fmt.Sprintf("send vote request to self %s %s", req.CandidateId, svr.serverId))
 	}
 
 	// 5.1 5.2
@@ -485,20 +512,40 @@ func (svr *server) followerClusterChange(ctx context.Context) {
 		zap.String("serverId", svr.serverId))
 
 	// 需要不断重试，直到终结状态出现
+	var firstRound = true
 	for {
-		// 等一个随机的事件继续发 150-300ms
-		time.Sleep(time.Duration(150+rand.Intn(150)) * time.Millisecond)
+		if !firstRound {
+			svr.lg.Info("candidate: wait for another round",
+				zap.String("serverId", svr.serverId),
+				zap.Int("currentTerm", svr.currentTerm))
+			// 等一个随机的事件继续发 150-300ms
+			time.Sleep(electionTimeout + time.Duration(150+rand.Intn(150))*time.Millisecond)
+		}
+		firstRound = false
+
+		svr.lg.Info("candidate: start select leader",
+			zap.String("serverId", svr.serverId),
+			zap.Int("currentTerm", svr.currentTerm))
+
+		if time.Since(svr.lastAppendEntriesTime) < electionTimeout {
+			svr.lg.Info("candidate: some on other became leader",
+				zap.String("serverId", svr.serverId),
+				zap.Int("currentTerm", svr.currentTerm))
+			svr.state = follower
+			break
+		}
 
 		// 每次不成功需要刷新term，并重新投票给自己
 		svr.currentTerm++
-		currentVoteTerm := svr.currentTerm
+		// currentVoteTerm := svr.currentTerm
 
 		// TODO 这块可以event driven出去，让另一个goroutine干，但目前暂时放在一起
 		var (
 			mu sync.Mutex
 			wg sync.WaitGroup
 
-			succCnt             int
+			// votedFor自己初始值就是1
+			succCnt             = 1
 			encounterBiggerTerm bool
 		)
 		wg.Add(len(svr.peers))
@@ -506,15 +553,20 @@ func (svr *server) followerClusterChange(ctx context.Context) {
 			go func(p *peer) {
 				defer wg.Done()
 
+				if p.endpoint == svr.serverId {
+					panic("ddd")
+				}
+
 				lastLog := &Log{}
 				if len(p.svr.logs) > 0 {
 					lastLog = p.svr.logs[len(p.svr.logs)-1]
 				}
 				req := &RequestVoteRequest{
-					Term:         p.svr.currentTerm,
-					CandidateId:  p.svr.serverId,
+					Term:         svr.currentTerm,
+					CandidateId:  svr.serverId,
 					LastLogIndex: lastLog.Index,
 					LastLogTerm:  lastLog.Term,
+					PeerEndpoint: p.endpoint,
 				}
 				resp, err := p.rpc.RequestVote(req)
 				if err != nil {
@@ -541,7 +593,7 @@ func (svr *server) followerClusterChange(ctx context.Context) {
 					svr.lg.Info("candidate: VoteGranted",
 						zap.String("serverId", svr.serverId),
 						zap.Int("svr.currentTerm", svr.currentTerm),
-						zap.String("peer", p.leaderId))
+						zap.String("peer", p.endpoint))
 
 					mu.Lock()
 					succCnt++
@@ -561,12 +613,12 @@ func (svr *server) followerClusterChange(ctx context.Context) {
 			svr.lg.Info("candidate: bigger term exist, return to follower",
 				zap.String("serverId", svr.serverId),
 				zap.Int("currentTerm", svr.currentTerm))
-			continue
+			break
 		}
 
 		// 1 查看是赢得当前的选举
-		majorityCnt := len(svr.peers)/2 + 1
-		if succCnt > majorityCnt {
+		majority := (len(svr.peers)+1)/2 + 1
+		if succCnt >= majority {
 			svr.state = leader
 
 			svr.lg.Info("candidate: became leader",
@@ -586,19 +638,6 @@ func (svr *server) followerClusterChange(ctx context.Context) {
 				zap.Int("currentTerm", svr.currentTerm))
 		}
 
-		// 2 查看是否已经有leader赢得选举，目前识别term是否有变更，以及是否投票给了别的server
-		if currentVoteTerm < svr.currentTerm {
-			svr.lg.Info("candidate: got newer append entries request",
-				zap.String("serverId", svr.serverId),
-				zap.Int("currentVoteTerm", currentVoteTerm),
-				zap.Int("currentTerm", svr.currentTerm))
-
-			svr.state = follower
-			// 弥补上面逻辑执行花费的时间，刷新 lastAppendEntriesTime
-			svr.lastAppendEntriesTime = time.Now()
-			break
-		}
-
 		svr.lg.Info("candidate: no winner try another round",
 			zap.String("serverId", svr.serverId),
 			zap.Int("currentTerm", svr.currentTerm))
@@ -606,12 +645,20 @@ func (svr *server) followerClusterChange(ctx context.Context) {
 }
 
 func (svr *server) leaderLoopAppendEntries(ctx context.Context) {
+
+	startTime := time.Now()
+
 	var init = true
 	ticker := time.Tick(time.Second)
 	for {
 		select {
 		case <-ticker:
 		case <-ctx.Done():
+			return
+		}
+
+		// 4 test 停止leader的工作，等待另一个服务接管
+		if time.Since(startTime) > 30*time.Second {
 			return
 		}
 
@@ -660,6 +707,11 @@ func (svr *server) leaderLoopAppendEntries(ctx context.Context) {
 
 				if !resp.Success {
 					svr.lg.Info("leader: failed to append entries",
+						zap.String("serverId", svr.serverId),
+						zap.Int("resp.Term", resp.Term),
+						zap.Int("svr.currentTerm", svr.currentTerm))
+				} else {
+					svr.lg.Info("leader: success to append entries",
 						zap.String("serverId", svr.serverId),
 						zap.Int("resp.Term", resp.Term),
 						zap.Int("svr.currentTerm", svr.currentTerm))

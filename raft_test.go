@@ -256,27 +256,35 @@ func TestServer_HandleRequestVote(t *testing.T) {
 }
 
 func TestServer_HandleClientRequest(t *testing.T) {
-	newServer(
+	svr1 := newServer(
 		[]string{
 			"localhost:8002",
 			"localhost:8003",
 		},
 		"localhost:8001",
 	)
-	newServer(
+	svr2 := newServer(
 		[]string{
 			"localhost:8001",
 			"localhost:8003",
 		},
 		"localhost:8002",
 	)
-	newServer(
+	svr3 := newServer(
 		[]string{
 			"localhost:8001",
 			"localhost:8002",
 		},
 		"localhost:8003",
 	)
+
+	MR.idAndCandidate[svr1.serverId] = svr1
+	MR.idAndCandidate[svr2.serverId] = svr2
+	MR.idAndCandidate[svr3.serverId] = svr3
+
+	svr1.start()
+	svr2.start()
+	svr3.start()
 
 	ch := make(chan struct{})
 	ch <- struct{}{}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"sync"
 )
 
 type Rpc interface {
@@ -12,21 +13,22 @@ type Rpc interface {
 	AppendEntries(request *AppendEntriesRequest) (*AppendEntriesResponse, error)
 }
 
-type memoryRpc struct {
-	server *server
+var MR = memoryRpc{
+	idAndCandidate: make(map[string]*server),
 }
 
-func newMemoryRpc(svr *server) *memoryRpc {
-	return &memoryRpc{server: svr}
+type memoryRpc struct {
+	mu             sync.Mutex
+	idAndCandidate map[string]*server
 }
 
 func (r *memoryRpc) RequestVote(request *RequestVoteRequest) (*RequestVoteResponse, error) {
-	resp := r.server.HandleRequestVote(request)
+	resp := r.idAndCandidate[request.PeerEndpoint].HandleRequestVote(request)
 	return resp, nil
 }
 
 func (r *memoryRpc) AppendEntries(request *AppendEntriesRequest) (*AppendEntriesResponse, error) {
-	resp := r.server.HandleAppendEntries(request)
+	resp := r.idAndCandidate[request.PeerEndpoint].HandleAppendEntries(request)
 	return resp, nil
 }
 
